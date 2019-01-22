@@ -1,0 +1,11 @@
+version: '3.7'
+
+services:
+  stage:
+    build:
+      context: ./misc/docker/
+    ports:
+      - 9000:80
+    volumes:
+      - ./:/app
+      - /var/run/docker.sock:/var/run/docker.sock
