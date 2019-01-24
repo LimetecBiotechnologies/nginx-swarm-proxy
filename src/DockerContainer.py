@@ -1,73 +1,68 @@
 import docker
 
+NGINX_CLIENT_PORT_LABEL = 'nginx.proxy.client.port'
+NGINX_CONTAINER_PORT_LABEL = 'nginx.proxy.container.port'
+NGINX_HOST_LABEL='nginx.proxy.host'
+
 
 class DockerContainer:
-    def __init__(self, client: docker.DockerClient, domains):
+    def __init__(self, client: docker.DockerClient, port, domains):
         self.client = client
-        self.addresses = []
+        self.port = port
         self.domains = domains
 
-    def find(self, port):
+    # find all containers required for this proxy-port
+    def find(self):
         containers = []
-        for container in self.client.containers.list(filters={'expose': port}):
-            result_container = self.convert_container(container, port)
-            if result_container['Ports'].__len__() > 0:
-                containers.append(self.convert_container(container, port))
+        for container in self.client.containers.list(filters={'label': NGINX_CLIENT_PORT_LABEL + '=' + str(self.port)}):
+            containers.append(self.convert_container(container))
         return containers
 
-    def listen(self, event, port):
+    # return event-container if required for proxy-port
+    def handle(self, event):
         if (event['Action'] == 'stop' and event['Type'] == 'container') or (
                 event['Action'] == 'start' and event['Type'] == 'container'):
             container = self.client.containers.get(event['id'])
-            result_container = self.convert_container(container, port)
-            result_container['Action'] = event['Action']
-            if event['Action'] == 'stop' or result_container['Ports'].__len__() > 0:
+            if NGINX_CLIENT_PORT_LABEL in container.attrs['Config']['Labels'] and container.attrs['Config']['Labels'][
+                NGINX_CLIENT_PORT_LABEL] == str(self.port):
+                result_container = self.convert_container(container)
+                result_container['Action'] = event['Action']
                 return result_container
         return None
 
-    def convert_container(self, container, port):
-        ports = self.find_ports(container.attrs['NetworkSettings']['Ports'], port)
-        return {'ID': container.attrs['Id'],
-                'Name': container.attrs['Name'].replace('/', ''),
-                'Labels': container.attrs['Config']['Labels'],
-                'Ports': ports,
-                'SourcePort': str(port),
-                'Addresses': self.addresses,
-                'ServerNames': self.server_names(container.attrs['Config']['Labels'],
-                                                 container.attrs['Name'])}
+    def convert_container(self, container):
+        container_port = self.port
+        if 'nginx.proxy.container.port' in container.attrs['Config']['Labels']:
+            container_port = container.attrs['Config']['Labels'][NGINX_CONTAINER_PORT_LABEL]
 
-    def server_names(self, labels, name):
+        return {
+            'ID': container.attrs['Id']
+            , 'ContainerPort': container_port
+            , 'ServerPort': self.find_port(container.attrs['NetworkSettings']['Ports'], container_port)
+            , 'ClientPort': self.port
+            , 'ServerNames': self.find_server_names(container)
+        }
+
+    def find_server_names(self, container):
         names = []
-        if 'dns.name' in labels:
-            names.append(labels['dns.name'])
+        if NGINX_HOST_LABEL in container.attrs['Config']['Labels']:
+            names.append(container.attrs['Config']['Labels'][NGINX_HOST_LABEL])
+        elif 'com.docker.compose.project' in container.attrs['Config']['Labels']:
+            names.append(container.attrs['Config']['Labels']['com.docker.compose.service'] + '.' +
+                         container.attrs['Config']['Labels']['com.docker.compose.project'])
+        # todo: com.docker.stack
+        else:
+            names.append(container.attrs['Name'].replace('/', ''))
 
-        if 'com.docker.stack.namespace' in labels:
-            start = labels['com.docker.stack.namespace'].__len__() + 1
-            names += self.add_domains(name[start:] + '.' + labels['com.docker.stack.namespace'], self.domains)
-
-        if 'com.docker.compose.service' in labels:
-            names += self.add_domains(labels['com.docker.compose.service'] + '.' + labels['com.docker.compose.project'],
-                                      self.domains)
-
-        if names.__len__() == 0:
-            names += self.add_domains(name, self.domains)
-        return ' '.join(names)
+        server_names = []
+        for name in names:
+            for domain in self.domains:
+                server_names.append(name + '.' + domain)
+        return server_names
 
     @staticmethod
-    def find_ports(ports, port):
+    def find_port(ports, port):
         tcp_port = str(port) + '/tcp'
-        result_ports = []
-        if port in ports:
-            for res in ports[port]:
-                result_ports.append(res['HostPort'])
-        elif tcp_port in ports and ports[tcp_port] is not None:
-            for res in ports[tcp_port]:
-                result_ports.append(res['HostPort'])
-        return result_ports
-
-    @staticmethod
-    def add_domains(host, domains):
-        names = []
-        for domain in domains:
-            names.append(host + '.' + domain)
-        return names
+        if tcp_port in ports and ports[tcp_port] is not None:
+            return ports[tcp_port][0]['HostPort']
+        return None
